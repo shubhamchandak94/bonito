@@ -62,7 +62,7 @@ $ source venv3/bin/activate
 (venv3) $ pip install --upgrade pip
 (venv3) $ pip install -r requirements.txt
 (venv3) $ python setup.py develop
-(venv3) $ bonito download --all
+(venv3) $ bonito download --all # I faced errors with this so I've included the model in the github repo itself (so can skip this)
 ```
 
 ## Medaka
