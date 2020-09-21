@@ -48,7 +48,8 @@ def main(args):
             posteriors = model(gpu_data).exp().cpu().numpy().squeeze()
             print('bonito: posteriors.shape', posteriors.shape)
             posteriors.tofile(args.post_file)
-            # writer.queue.put((read_id, posteriors))
+            if args.write_basecall:
+                writer.queue.put((read_id, posteriors))
 
     duration = time.perf_counter() - t0
 
@@ -69,4 +70,5 @@ def argparser():
     parser.add_argument("--beamsize", default=5, type=int)
     parser.add_argument("--half", action="store_true", default=False)
     parser.add_argument("--post_file",type=str,required=True)
+    parser.add_argument("--write_basecall",default=False,action='store_true')
     return parser
