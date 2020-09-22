@@ -41,8 +41,8 @@ def main(args):
     else:
         aligner = None
 
-    with open(summary_file(), 'w') as summary:
-        write_summary_header(summary, alignment=aligner)
+#    with open(summary_file(), 'w') as summary:
+#        write_summary_header(summary, alignment=aligner)
 
     samples = 0
     num_reads = 0
@@ -70,8 +70,6 @@ def main(args):
             if read is None:
                 break
 
-            read_id, raw_data = read
-            print('bonito: raw_data.shape: ', raw_data.shape)
             if len(read.signal) > max_read_size:
                 sys.stderr.write("> skipping long read %s (%s samples)\n" % (read.read_id, len(read.signal)))
                 continue
@@ -80,6 +78,7 @@ def main(args):
             samples += len(read.signal)
 
             raw_data = torch.tensor(read.signal.astype(dtype))
+            print('bonito: raw_data.shape: ', raw_data.shape)
             chunks = chunk(raw_data, args.chunksize, args.overlap)
             
             posteriors_ = model(chunks.to(args.device)).cpu().numpy()

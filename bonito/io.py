@@ -373,7 +373,7 @@ class DecoderWriter(Process):
                 mapping = False
 
             if sequence:
-                with self.lock, open(summary_file(), 'a') as summary:
+#                with self.lock, open(summary_file(), 'a') as summary:
                     if self.aligner:
                         for mapping in self.aligner.map(sequence):
                             write_sam(read.read_id, sequence, qstring, mapping)
@@ -385,6 +385,6 @@ class DecoderWriter(Process):
                         write_fastq(read.read_id, sequence, qstring)
                     else:
                         write_fasta(read.read_id, sequence)
-                    write_summary_row(summary, read, len(sequence), mean_qscore, alignment=mapping)
+#                    write_summary_row(summary, read, len(sequence), mean_qscore, alignment=mapping)
             else:
                 logger.warn("> skipping empty sequence %s", read.read_id)
