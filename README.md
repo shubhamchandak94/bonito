@@ -2,31 +2,43 @@
 
 [![PyPI version](https://badge.fury.io/py/ont-bonito.svg)](https://badge.fury.io/py/ont-bonito)
 
-A convolutional basecaller inspired by QuartzNet.
-
-## Features
-
- - Raw signal input.
- - Simple 5 state output `{BLANK, A, C, G, T}`.
- - CTC training.
- - Small Python codebase.
-
-## Basecalling
+A PyTorch Basecaller for Oxford Nanopore Reads.
 
 ```bash
 $ pip install ont-bonito
 $ bonito basecaller dna_r9.4.1 /data/reads > basecalls.fasta
 ```
 
-If you have a `turing` or `volta` GPU the `--half` flag can be uses to increase performance.
+If a reference is provided in either `.fasta` or `.mmi` format then bonito will output in `sam` format.
+
+```bash
+$ bonito basecaller dna_r9.4.1 --reference reference.mmi /data/reads > basecalls.sam
+```
+ 
+## Pair Decoding
+
+Pair decoding takes a template and complement read to produce higher quaility calls.
+
+```bash
+$ bonito pairs pairs.csv /data/reads > basecalls.fasta
+```
+
+The `pairs.csv` file is expected to contain pairs of read ids per line *(seperated by a single space)*.
 
 ## Training your own model
 
-To train your own model first download the training data.
+To train a model using your own reads, first basecall the reads with the additional `--save-ctc` flag and use the output directory as the input directory for training.
+
+```bash
+$ bonito basecaller dna_r9.4.1 --save-ctc --reference reference.mmi /data/reads > /data/training/ctc-data/basecalls.sam
+$ bonito train --amp --directory /data/training/ctc-data /data/training/model-dir
+```
+
+If you are interested in method development and don't have you own set of reads then a pre-prepared set is provide.
 
 ```bash
 $ bonito download --training
-$ bonito train --amp /data/model-dir
+$ bonito train --amp /data/training/model-dir
 ```
 
 Automatic mixed precision can be used to speed up training with the `--amp` flag *(however [apex](https://github.com/nvidia/apex#quick-start) needs to be installed manually)*.
@@ -38,7 +50,7 @@ $ export CUDA_VISIBLE_DEVICES=0,1,2,3
 $ bonito train --amp --multi-gpu --batch 256 /data/model-dir
 ```
 
-To evaluate the pretrained model run `bonito evaluate dna_r9.4.1 --half`.
+To evaluate the pretrained model run `bonito evaluate dna_r9.4.1`.
 
 For a model you have trainined yourself, replace `dna_r9.4.1` with the model directory.
 
@@ -67,29 +79,27 @@ $ source venv3/bin/activate
 
 ## Medaka
 
-An pre-release Medaka can be downloaded from [here](https://nanoporetech.box.com/shared/static/oukeesfjc6406t5po0x2hlw97lnelkyl.hdf5).
+The Medaka can be downloaded from [here](https://nanoporetech.box.com/shared/static/u5gncwjbtg2k3dkw26nmvdvck65ab3xh.hdf5).
 
 It has been trained on Zymo: *E. faecalis, P. aeruginosa, S. enterica1, S.aureus and E.coli (with L. monocytogenes and B. subtilis held out)*.
 
-
 | Coverage | B. subtilis | E. coli | E. faecalis | L. monocytogenes | S. aureus | S. enterica |
 | -------- |:-----------:|:-------:|:-----------:|:----------------:|:---------:|:-----------:|
-|       25 |       36.20 |   37.96 |       36.38 |            36.95 |     39.21 |       37.24 |
-|       50 |       40.63 |   42.22 |       40.97 |            43.01 |     45.23 |       41.55 |
-|       75 |       42.22 |   43.98 |       43.01 |            43.98 |     50.00 |       43.98 |
-|      100 |       45.23 |   45.23 |       44.56 |            45.23 |     50.00 |       45.23 |
-|      125 |       45.23 |   45.42 |       45.23 |            46.99 |     50.00 |       45.23 |
-|      150 |       45.23 |   45.23 |       46.99 |            46.99 |     50.00 |       46.99 |
-|      175 |       46.99 |   46.99 |       45.23 |            48.24 |     50.00 |       46.99 |
-|      200 |       45.23 |   45.23 |       46.99 |            46.99 |     50.00 |       46.99 |
-
-*Note: We working on training a full release model from a broader training set that we expect to generalises better.*
+|       25 |       36.92 |   39.51 |       36.68 |            37.33 |     36.87 |       37.70 |
+|       50 |       41.55 |   43.98 |       40.97 |            42.22 |     42.22 |       42.22 |
+|       75 |       43.01 |   45.23 |       42.22 |            43.01 |     43.01 |       43.98 |
+|      100 |       43.01 |   45.23 |       43.98 |            43.47 |     44.56 |       45.23 |
+|      125 |       45.23 |   46.99 |       43.98 |            45.23 |     45.23 |       45.23 |
+|      150 |       45.23 |   46.99 |       45.23 |            45.23 |     45.23 |       46.99 |
+|      175 |       46.12 |   46.99 |       45.23 |            46.99 |     46.99 |       46.99 |
+|      200 |       46.99 |   46.99 |       45.23 |            45.23 |     46.99 |       46.99 |
 
 ### References
 
  - [Sequence Modeling With CTC](https://distill.pub/2017/ctc/)
  - [Quartznet: Deep Automatic Speech Recognition With 1D Time-Channel Separable Convolutions](https://arxiv.org/pdf/1910.10261.pdf)
-
+ - [Pair consensus decoding improves accuracy of neural network basecallers for nanopore sequencing](https://www.biorxiv.org/content/10.1101/2020.02.25.956771v1.full.pdf)
+ 
 ### Licence and Copyright
 (c) 2019 Oxford Nanopore Technologies Ltd.
 

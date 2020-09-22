@@ -1,7 +1,8 @@
 *.pyc
 *~
 .venv/
-venv3/
+build/
+venv3*/
 *.lprof
 *.egg-info/
 bonito/data/*

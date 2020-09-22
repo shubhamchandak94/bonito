@@ -9,11 +9,14 @@ from glob import glob
 from collections import defaultdict, OrderedDict
 
 from bonito.model import Model
+from bonito_cuda_runtime import CuModel
 
 import toml
 import torch
 import parasail
 import numpy as np
+from scipy.signal import find_peaks
+from torch.cuda import get_device_capability
 from ont_fast5_api.fast5_interface import get_fast5_file
 
 try:
@@ -31,7 +34,36 @@ __url__ = "https://nanoporetech.box.com/shared/static/"
 
 split_cigar = re.compile(r"(?P<len>\d+)(?P<op>\D+)")
 default_data = os.path.join(__data__, "dna_r9.4.1")
-default_config = os.path.join(__configs__, "quartznet5x5.toml")
+default_config = os.path.join(__configs__, "dna_r9.4.1.toml")
+
+
+class Read:
+
+    def __init__(self, read, filename):
+
+        self.read_id = read.read_id
+        self.run_id = read.get_run_id().decode()
+        self.filename = os.path.basename(read.filename)
+
+        read_attrs = read.handle[read.raw_dataset_group_name].attrs
+        channel_info = read.handle[read.global_key + 'channel_id'].attrs
+
+        self.offset = int(channel_info['offset'])
+        self.sampling_rate = channel_info['sampling_rate']
+        self.scaling = channel_info['range'] / channel_info['digitisation']
+
+        self.mux = read_attrs['start_mux']
+        self.channel = channel_info['channel_number'].decode()
+        self.start = read_attrs['start_time'] / self.sampling_rate
+        self.duration = read_attrs['duration'] / self.sampling_rate
+
+        # no trimming
+        self.template_start = self.start
+        self.template_duration = self.duration
+
+        raw = read.handle[read.raw_dataset_name][:]
+        scaled = np.array(self.scaling * (raw + self.offset), dtype=np.float32)
+        self.signal = norm_by_noisiest_section(scaled)
 
 
 def init(seed, device):
@@ -50,6 +82,39 @@ def init(seed, device):
     assert(torch.cuda.is_available())
 
 
+def half_supported():
+    """
+    Returns whether FP16 is support on the GPU
+    """
+    return get_device_capability()[0] >= 7
+
+
+def phred(prob, scale=1.0, bias=0.0):
+    """
+    Converts `prob` into a ascii encoded phred quality score between 0 and 40.
+    """
+    p = max(1 - prob, 1e-4)
+    q = -10 * np.log10(p) * scale + bias
+    return chr(int(np.round(q) + 33))
+
+
+def mean_qscore_from_qstring(qstring):
+    """
+    Convert qstring into a mean qscore
+    """
+    if len(qstring) == 0: return 0.0
+    err_probs = [10**((ord(c) - 33) / -10) for c in qstring]
+    mean_err = np.mean(err_probs)
+    return -10 * np.log10(max(mean_err, 1e-4))
+
+
+def decode_ref(encoded, labels):
+    """
+    Convert a integer encoded reference into a string and remove blanks
+    """
+    return ''.join(labels[e] for e in encoded if e)
+
+
 def med_mad(x, factor=1.4826):
     """
     Calculate signal median and median absolute deviation
@@ -59,90 +124,89 @@ def med_mad(x, factor=1.4826):
     return med, mad
 
 
-def trim(signal, window_size=40, threshold_factor=3.0, min_elements=3):
+def norm_by_noisiest_section(signal, samples=100, threshold=6.0):
+    """
+    Normalise using the medmad from the longest continuous region where the
+    noise is above some threshold relative to the std of the full signal.
+    """
+    threshold = signal.std() / threshold
+    noise = np.ones(signal.shape)
 
-    med, mad = med_mad(signal[-(window_size*25):])
-    threshold = med + mad * threshold_factor
-    num_windows = len(signal) // window_size
+    for idx in np.arange(signal.shape[0] // samples):
+        window = slice(idx * samples, (idx + 1) * samples)
+        noise[window] = np.where(signal[window].std() > threshold, 1, 0)
 
-    for pos in range(num_windows):
+    # start and end low for peak finding
+    noise[0] = 0; noise[-1] = 0
+    peaks, info = find_peaks(noise, width=(None, None))
 
-        start = pos * window_size
-        end = start + window_size
-
-        window = signal[start:end]
-
-        if len(window[window > threshold]) > min_elements:
-            if window[-1] > threshold:
-                continue
-            return end, len(signal)
-
-    return 0, len(signal)
-
-
-def preprocess(x, min_samples=1000):
-    start, end = trim(x)
-    # REVISIT: we can potentially trim all the signal if this goes wrong
-    if end - start < min_samples:
-        start = 0
-        end = len(x)
-        #sys.stderr.write("badly trimmed read\n")
-
-    med, mad = med_mad(x[start:end])
-    norm_signal = (x[start:end] - med) / mad
-    return norm_signal
+    if len(peaks):
+        widest = np.argmax(info['widths'])
+        med, mad = med_mad(signal[info['left_bases'][widest]: info['right_bases'][widest]])
+    else:
+        med, mad = med_mad(signal)
+    return (signal - med) / mad
 
 
-def get_raw_data(filename):
+def get_raw_data(filename, read_ids=None, skip=False):
     """
     Get the raw signal and read id from the fast5 files
     """
     with get_fast5_file(filename, 'r') as f5_fh:
-        for read in f5_fh.get_reads():
-            raw = read.handle[read.raw_dataset_name][:]
-            channel_info = read.handle[read.global_key + 'channel_id'].attrs
-            scaling = channel_info['range'] / channel_info['digitisation']
-            offset = int(channel_info['offset'])
-            scaled = np.array(scaling * (raw + offset), dtype=np.float32)
-            yield read.read_id, preprocess(scaled)
+        for read_id in f5_fh.get_read_ids():
+            if read_ids is None or (read_id in read_ids) ^ skip:
+                yield Read(f5_fh.get_read(read_id), filename)
 
 
-def window(data, size, stepsize=1, padded=False, axis=-1):
+def get_raw_data_for_read(filename, read_id):
     """
-    Segment data in `size` chunks with overlap
+    Get the raw signal from the fast5 file for a given read_id
     """
-    shape = list(data.shape)
-    shape[axis] = np.floor(data.shape[axis] / stepsize - size / stepsize + 1).astype(int)
-    shape.append(size)
-
-    strides = list(data.strides)
-    strides[axis] *= stepsize
-    strides.append(data.strides[axis])
-
-    return np.lib.stride_tricks.as_strided(data, shape=shape, strides=strides)
+    with get_fast5_file(filename, 'r') as f5_fh:
+        return Read(f5_fh.get_read(read_id), filename)
 
 
-def chunk_data(raw_data, chunksize, overlap):
+def get_reads(directory, read_ids=None, skip=False):
     """
-    Break reads into chunks before calling
+    Get all reads in a given `directory`.
     """
-    if len(raw_data) <= chunksize:
-        chunks = np.expand_dims(raw_data, axis=0)
-    else:
-        chunks = window(raw_data, chunksize, stepsize=chunksize - overlap)
-    return np.expand_dims(chunks, axis=1)
+    for fast5 in glob("%s/*fast5" % directory):
+        yield from get_raw_data(fast5, read_ids=read_ids, skip=skip)
+
+
+def chunk(raw_data, chunksize, overlap):
+    """
+    Convert a read into overlapping chunks before calling
+    """
+    if chunksize > 0 and raw_data.shape[0] > chunksize:
+        num_chunks = raw_data.shape[0] // (chunksize - overlap) + 1
+        tmp = torch.zeros(num_chunks * (chunksize - overlap)).type(raw_data.dtype)
+        tmp[:raw_data.shape[0]] = raw_data
+        return tmp.unfold(0, chunksize, chunksize - overlap).unsqueeze(1)
+    return raw_data.unsqueeze(0).unsqueeze(0)
 
 
 def stitch(predictions, overlap):
     """
     Stitch predictions together with a given overlap
     """
-    if len(predictions) == 1:
-        return np.squeeze(predictions, axis=0)
+    if predictions.shape[0] == 1:
+        return predictions.squeeze(0)
     stitched = [predictions[0, 0:-overlap]]
     for i in range(1, predictions.shape[0] - 1): stitched.append(predictions[i][overlap:-overlap])
     stitched.append(predictions[-1][overlap:])
     return np.concatenate(stitched)
+
+
+def column_to_set(filename, idx=0, sep=' ', skip_header=False):
+    """
+    Pull a column from a file and return a set of the values.
+    """
+    if filename and os.path.isfile(filename):
+        with open(filename, 'r') as tsv:
+            if skip_header:
+                next(tsv)
+            return {line.strip().split(sep)[idx] for line in tsv.readlines()}
 
 
 def load_data(shuffle=False, limit=None, directory=None, validation=False):
@@ -155,18 +219,16 @@ def load_data(shuffle=False, limit=None, directory=None, validation=False):
     if validation and os.path.exists(os.path.join(directory, 'validation')):
         directory = os.path.join(directory, 'validation')
 
-    chunks = np.load(os.path.join(directory, "chunks.npy"), mmap_mode='r')
-    chunk_lengths = np.load(os.path.join(directory, "chunk_lengths.npy"), mmap_mode='r')
-    targets = np.load(os.path.join(directory, "references.npy"), mmap_mode='r')
-    target_lengths = np.load(os.path.join(directory, "reference_lengths.npy"), mmap_mode='r')
+    chunks = np.load(os.path.join(directory, "chunks.npy"))
+    chunk_lengths = np.load(os.path.join(directory, "chunk_lengths.npy"))
+    targets = np.load(os.path.join(directory, "references.npy"))
+    target_lengths = np.load(os.path.join(directory, "reference_lengths.npy"))
 
     if shuffle:
-        shuf = np.random.permutation(chunks.shape[0])
-        chunks = chunks[shuf]
-        chunk_lengths = chunk_lengths[shuf]
-        targets = targets[shuf]
-        target_lengths = target_lengths[shuf]
-
+        state = np.random.get_state()
+        for array in (chunks, chunk_lengths, targets, target_lengths):
+            np.random.set_state(state)
+            np.random.shuffle(array)
     if limit:
         chunks = chunks[:limit]
         chunk_lengths = chunk_lengths[:limit]
@@ -176,7 +238,7 @@ def load_data(shuffle=False, limit=None, directory=None, validation=False):
     return chunks, chunk_lengths, targets, target_lengths
 
 
-def load_model(dirname, device, weights=None, half=False):
+def load_model(dirname, device, weights=None, half=False, chunksize=0, use_rt=False):
     """
     Load a model from disk
     """
@@ -201,6 +263,9 @@ def load_model(dirname, device, weights=None, half=False):
         new_state_dict[name] = v
 
     model.load_state_dict(new_state_dict)
+
+    if use_rt:
+        model = CuModel(model.config, chunksize, new_state_dict)
 
     if half: model = model.half()
     model.eval()
@@ -241,13 +306,19 @@ def parasail_to_sam(result, seq):
     return rstart, new_cigstr
 
 
-def accuracy(ref, seq, balanced=False):
+def accuracy(ref, seq, balanced=False, min_coverage=0.0):
     """
     Calculate the accuracy between `ref` and `seq`
     """
-    alignment = parasail.sw_trace_striped_32(ref, seq, 8, 4, parasail.dnafull)
+    alignment = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
     counts = defaultdict(int)
     _, cigar = parasail_to_sam(alignment, seq)
+
+    q_coverage = len(alignment.traceback.query) / len(seq)
+    r_coverage = len(alignment.traceback.ref) / len(ref)
+
+    if r_coverage < min_coverage:
+        return 0.0
 
     for count, op  in re.findall(split_cigar, cigar):
         counts[op] += int(count)
@@ -263,10 +334,11 @@ def print_alignment(ref, seq):
     """
     Print the alignment between `ref` and `seq`
     """
-    alignment = parasail.sw_trace_striped_32(ref, seq, 8, 4, parasail.dnafull)
-    print(alignment.traceback.query)
-    print(alignment.traceback.comp)
+    alignment = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
     print(alignment.traceback.ref)
+    print(alignment.traceback.comp)
+    print(alignment.traceback.query)
+
     print("  Score=%s" % alignment.score)
     return alignment.score
 
